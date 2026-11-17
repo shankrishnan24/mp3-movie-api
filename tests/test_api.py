@@ -1,4 +1,7 @@
-"""Tests for movie uploads, SQL queries, and processing."""
+"""Tests for movie uploads, SQL queries, processing, and caching."""
+
+import csv
+import io
 
 import main
 from src import MovieStorage
@@ -42,12 +45,17 @@ def test_search(client, uploaded_movies):
 
 
 def test_upload_replaces_movies(client, uploaded_movies, sample_csv):
+    first = client.get("/movies")
+    assert first.status_code == 200
+    assert main.cache.get(100) == first.json()
+
     response = client.post(
         "/upload",
         files={"file": ("sample_movies.csv", sample_csv, "text/csv")},
     )
 
     assert response.status_code == 200
+    assert main.cache.get(100) is None
     assert client.get("/movies").json()["total_rows"] == 20
 
 
@@ -126,3 +134,87 @@ def test_empty_database(client):
     assert response.status_code == 200
     assert response.json() == {"data": [], "total_rows": 0}
     assert client.post("/movies/process", json={}).status_code == 400
+
+
+def test_movies_persist(client, test_storage, uploaded_movies, sample_csv):
+    reopened = MovieStorage(test_storage.db_path)
+    movies = reopened.get()
+
+    assert reopened.count_movies() == 20
+    assert list(movies.columns) == [
+        "title",
+        "release_year",
+        "rating",
+        "genre",
+    ]
+
+    original = list(csv.DictReader(io.StringIO(sample_csv.decode())))
+    assert movies["title"].tolist() == [
+        row["title"] for row in original
+    ]
+
+    stored = reopened.select_columns(["title"], limit=100)
+    response = client.get("/movies", params={"limit": 100})
+
+    assert response.status_code == 200
+    expected_ids = list(range(1, 21))
+    assert [row["id"] for row in stored] == expected_ids
+    assert [row["id"] for row in response.json()["data"]] == expected_ids
+
+
+def test_cache_and_processing(client, uploaded_movies, processing_body):
+    responses = {}
+
+    for limit in [100, 1]:
+        response = client.get("/movies", params={"limit": limit})
+        assert response.status_code == 200
+        responses[limit] = response.json()
+        assert main.cache.get(limit) == response.json()
+
+    repeated = client.get("/movies", params={"limit": 100})
+    assert repeated.status_code == 200
+    assert repeated.json() == responses[100]
+
+    processed = client.post("/movies/process", json=processing_body)
+
+    assert processed.status_code == 200
+    assert processed.json() == {
+        "validation_rows_removed": 0,
+        "cleaning_report": {
+            "rows_before": 20,
+            "rows_after": 16,
+            "rows_removed": 4,
+            "columns_before": 4,
+            "columns_after": 4,
+            "columns_removed": 0,
+        },
+    }
+
+    assert main.cache.get(100) is None
+    assert main.cache.get(1) is None
+
+    response = client.get("/movies", params={"limit": 100})
+    assert response.status_code == 200
+    result = response.json()
+
+    assert result["total_rows"] == 16
+    assert [row["title"] for row in result["data"]] == [
+        f"Movie {letter}" for letter in "ABCDEFGHIJKLMNOP"
+    ]
+    assert [row["id"] for row in result["data"]] == list(range(1, 17))
+    assert main.cache.get(100) == result
+
+
+def test_cache_hit_skips_database(client, uploaded_movies, monkeypatch):
+    first = client.get("/movies", params={"limit": 100})
+    assert first.status_code == 200
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("A cache hit should skip database reads")
+
+    monkeypatch.setattr(main.storage, "select_columns", fail_if_called)
+    monkeypatch.setattr(main.storage, "count_movies", fail_if_called)
+
+    second = client.get("/movies", params={"limit": 100})
+    assert second.status_code == 200
+    assert second.json() == first.json()

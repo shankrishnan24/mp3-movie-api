@@ -1,4 +1,4 @@
-"""Test fixtures using a temporary SQLite database."""
+"""Test fixtures with isolated storage and caching."""
 
 from pathlib import Path
 
@@ -6,13 +6,18 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from src import MovieStorage
+from src import MovieCache, MovieStorage
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    storage = MovieStorage(tmp_path / "movies.db")
-    monkeypatch.setattr(main, "storage", storage)
+def test_storage(tmp_path):
+    return MovieStorage(tmp_path / "test_movies.db")
+
+
+@pytest.fixture
+def client(test_storage, monkeypatch):
+    monkeypatch.setattr(main, "storage", test_storage)
+    monkeypatch.setattr(main, "cache", MovieCache())
 
     with TestClient(main.app) as test_client:
         yield test_client
@@ -36,3 +41,25 @@ def uploaded_movies(client, sample_csv):
     )
     assert response.status_code == 200
     return response.json()
+
+
+@pytest.fixture
+def processing_body():
+    return {
+        "validation": {
+            "required_columns": [
+                "title", "release_year", "rating", "genre"
+            ],
+            "numeric_columns": ["release_year", "rating"],
+        },
+        "processing": {
+            "remove_duplicates": True,
+            "missing": {"enabled": True, "axis": "rows"},
+            "outliers": {
+                "enabled": True,
+                "columns": ["rating"],
+                "method": "iqr",
+                "threshold": 1.5,
+            },
+        },
+    }
